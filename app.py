@@ -1,4 +1,4 @@
-import os
+import io
 from pathlib import Path
 from typing import Tuple, List
 
@@ -10,10 +10,6 @@ import streamlit as st
 
 
 # ---------- Utility functions ----------
-
-OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
 
 def normalize_image(gray: np.ndarray) -> np.ndarray:
     """Normalize contrast to 0-255 uint8."""
@@ -104,8 +100,6 @@ def compute_colony_stats(
     total = len(rows)
     if total > 0:
         df["total"] = total
-    else:
-        df["total"] = []
     return df, total
 
 
@@ -141,7 +135,7 @@ def segment_confluency(
     elif method == "Triangle":
         _, mask = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE)
     else:
-        # Fallback: adaptive threshold
+        # Adaptive
         mask = cv2.adaptiveThreshold(
             inv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 2
         )
@@ -183,8 +177,7 @@ def confluency_overlay_image(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndar
     return overlay
 
 
-# ---------- Streamlit UI ----------
-
+# ---------- CFU mode (UI-focused) ----------
 
 def run_cfu_mode():
     st.header("Scenario A — CFU: Count in a Click")
@@ -210,7 +203,7 @@ def run_cfu_mode():
             st.info(f"I see {len(uploaded_files)} plates — running batch analysis now.")
 
         all_rows: List[pd.DataFrame] = []
-        preview_overlays = []
+        summary_rows = []
 
         for f in uploaded_files:
             file_bytes = np.frombuffer(f.read(), np.uint8)
@@ -227,38 +220,74 @@ def run_cfu_mode():
             df, total = compute_colony_stats(labels, image_name)
             all_rows.append(df)
 
+            # ---- UI: per-image results ----
+            st.subheader(f"Results — {image_name}")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Total colonies", total)
+            with c2:
+                if len(df) > 0:
+                    st.metric("Median colony size (px)", int(df["size"].median()))
+                else:
+                    st.metric("Median colony size (px)", 0)
+
+            st.caption("Per-colony measurements")
+            if len(df) > 0:
+                st.dataframe(
+                    df[["object_id", "x", "y", "size"]],
+                    use_container_width=True,
+                )
+            else:
+                st.write("No colonies detected with current parameters.")
+
+            # Overlay preview
             overlay_img = colony_overlay_image(image_bgr, labels)
-            preview_overlays.append((image_name, overlay_img))
-
-            # Save outputs
-            base = Path(image_name).stem
-            csv_path = OUTPUT_DIR / f"{base}_CFU_counts.csv"
-            overlay_path = OUTPUT_DIR / f"{base}_CFU_overlay.png"
-            mask_path = OUTPUT_DIR / f"{base}_CFU_mask.png"
-
-            df.to_csv(csv_path, index=False)
-            cv2.imwrite(str(overlay_path), overlay_img)
-            cv2.imwrite(str(mask_path), overlay_mask)
-
-            st.success(f"Count complete for {image_name}: {total} colonies.")
-            st.caption(f"CSV and overlay saved to {csv_path} and {overlay_path}")
-
-        # Show overlays
-        for image_name, overlay_img in preview_overlays:
-            st.subheader(f"Overlay preview — {image_name}")
             st.image(
                 cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB),
                 caption=f"Detected colonies on {image_name}",
                 use_column_width=True,
             )
 
-        # Combined CSV for read-out slide
-        if all_rows:
-            combined = pd.concat(all_rows, ignore_index=True)
-            combined_path = OUTPUT_DIR / "CFU_counts.csv"
-            combined.to_csv(combined_path, index=False)
-            st.info(f"Combined CFU counts saved to {combined_path}")
+            # Optional: downloadable CSV for this image
+            if len(df) > 0:
+                csv_buf = io.StringIO()
+                df.to_csv(csv_buf, index=False)
+                st.download_button(
+                    label=f"Download CSV for {image_name}",
+                    data=csv_buf.getvalue(),
+                    file_name=f"{Path(image_name).stem}_CFU_counts.csv",
+                    mime="text/csv",
+                )
 
+            # Save a small summary row for cross-image table
+            summary_rows.append(
+                {
+                    "image_name": image_name,
+                    "total_colonies": total,
+                    "median_size_px": int(df["size"].median()) if len(df) > 0 else 0,
+                }
+            )
+
+        # ---- UI: summary across images ----
+        if summary_rows:
+            st.markdown("---")
+            st.subheader("Summary across all CFU images")
+            summary_df = pd.DataFrame(summary_rows)
+            st.dataframe(summary_df, use_container_width=True)
+
+            # Combined CSV download
+            all_combined = pd.concat(all_rows, ignore_index=True)
+            combined_buf = io.StringIO()
+            all_combined.to_csv(combined_buf, index=False)
+            st.download_button(
+                label="Download combined CFU_counts.csv",
+                data=combined_buf.getvalue(),
+                file_name="CFU_counts.csv",
+                mime="text/csv",
+            )
+
+
+# ---------- Confluency mode (UI-focused) ----------
 
 def run_confluency_mode():
     st.header("Scenario B — Confluency Estimation")
@@ -279,7 +308,7 @@ def run_confluency_mode():
         )
     with col2:
         st.caption(
-            "Tip: If the mask looks noisy, adjust illumination in your source image for the next run."
+            "If the mask looks noisy, try a different method or adjust acquisition settings next time."
         )
 
     if uploaded_files:
@@ -291,6 +320,7 @@ def run_confluency_mode():
             )
 
         all_rows: List[pd.DataFrame] = []
+
         for f in uploaded_files:
             file_bytes = np.frombuffer(f.read(), np.uint8)
             image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -307,49 +337,57 @@ def run_confluency_mode():
 
             percent = df["percent_confluence"].iloc[0]
 
+            # ---- UI: per-image results ----
+            st.subheader(f"Results — {image_name}")
+            st.metric("Percent confluency", f"{percent:.1f}%")
+
+            st.caption("Overlay of detected cell-covered area")
             overlay_img = confluency_overlay_image(image_bgr, mask)
-
-            base = Path(image_name).stem
-            csv_path = OUTPUT_DIR / f"{base}_confluency.csv"
-            overlay_path = OUTPUT_DIR / f"{base}_confluency_overlay.png"
-            mask_path = OUTPUT_DIR / f"{base}_confluency_mask.png"
-
-            df.to_csv(csv_path, index=False)
-            cv2.imwrite(str(overlay_path), overlay_img)
-            cv2.imwrite(str(mask_path), mask)
-
-            st.success(
-                f"Confluency estimated for {image_name}: {percent:.1f}% coverage."
-            )
-            st.caption(f"CSV and mask saved to {csv_path} and {overlay_path}")
-
-            st.subheader(f"Mask preview — {image_name}")
             st.image(
                 cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB),
                 caption=f"Estimated confluency: {percent:.1f}%",
                 use_column_width=True,
             )
 
-        if all_rows:
-            combined = pd.concat(all_rows, ignore_index=True)
-            combined_path = OUTPUT_DIR / "confluency_results.csv"
-            combined.to_csv(combined_path, index=False)
-            st.info(f"Combined confluency results saved to {combined_path}")
+            # Optional: per-image CSV download
+            csv_buf = io.StringIO()
+            df.to_csv(csv_buf, index=False)
+            st.download_button(
+                label=f"Download CSV for {image_name}",
+                data=csv_buf.getvalue(),
+                file_name=f"{Path(image_name).stem}_confluency.csv",
+                mime="text/csv",
+            )
 
+        # ---- UI: combined table across images ----
+        if all_rows:
+            st.markdown("---")
+            st.subheader("Confluency summary across images")
+            combined = pd.concat(all_rows, ignore_index=True)
+            st.dataframe(combined, use_container_width=True)
+
+            combined_buf = io.StringIO()
+            combined.to_csv(combined_buf, index=False)
+            st.download_button(
+                label="Download combined confluency_results.csv",
+                data=combined_buf.getvalue(),
+                file_name="confluency_results.csv",
+                mime="text/csv",
+            )
+
+
+# ---------- Main app ----------
 
 def main():
     st.title("Count in a Click — CFU & Confluency Demo")
     st.write(
-        "Quick local prototype to count colonies and estimate confluency, with CSV + overlay outputs."
+        "Quick prototype to count colonies and estimate confluency, with on-screen metrics and optional CSV export."
     )
 
     mode = st.sidebar.radio(
         "Choose scenario",
         ["CFU: Colony Count", "Confluency: % Area Covered"],
     )
-
-    st.sidebar.markdown("### Output folder")
-    st.sidebar.code(str(OUTPUT_DIR.resolve()))
 
     if mode == "CFU: Colony Count":
         run_cfu_mode()
