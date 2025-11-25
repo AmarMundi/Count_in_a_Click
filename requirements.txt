@@ -1,5 +1,5 @@
-opencv-python
 streamlit
-skimage
+opencv-python-headless
 scikit-image
-scikit-learn
+numpy
+pandas
